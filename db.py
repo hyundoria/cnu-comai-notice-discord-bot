@@ -3,6 +3,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+# 파이썬 3.8 호환을 위해 typing 모듈에서 필요한 타입들을 모두 불러옵니다.
+from typing import Optional, List, Tuple, Set, Dict, Any
+
 DB_PATH = Path(__file__).parent / "bot.db"
 
 SCHEMA = """
@@ -60,7 +63,8 @@ def upsert_guild_channel(guild_id: int, channel_id: int):
               SET channel_id=excluded.channel_id, updated_at=excluded.updated_at
         """, (guild_id, channel_id, _now()))
 
-def get_guild_channel(guild_id: int) -> int | None:
+# 수정 1: int | None -> Optional[int]
+def get_guild_channel(guild_id: int) -> Optional[int]:
     with connect() as c:
         row = c.execute(
             "SELECT channel_id FROM guild_channels WHERE guild_id=?",
@@ -68,7 +72,8 @@ def get_guild_channel(guild_id: int) -> int | None:
         ).fetchone()
         return row["channel_id"] if row else None
 
-def all_guild_channels() -> list[tuple[int, int]]:
+# 수정 2: list[tuple[int, int]] -> List[Tuple[int, int]]
+def all_guild_channels() -> List[Tuple[int, int]]:
     with connect() as c:
         rows = c.execute(
             "SELECT guild_id, channel_id FROM guild_channels"
@@ -84,7 +89,8 @@ def is_baseline_empty(category: str) -> bool:
         ).fetchone()
         return row is None
 
-def filter_new(category: str, article_nos: list[str]) -> set[str]:
+# 수정 3: list[str] -> List[str], set[str] -> Set[str]
+def filter_new(category: str, article_nos: List[str]) -> Set[str]:
     """이 카테고리에서 처음 보는 article_no만 골라 set으로 반환."""
     if not article_nos:
         return set()
@@ -98,7 +104,8 @@ def filter_new(category: str, article_nos: list[str]) -> set[str]:
         existing = {r["article_no"] for r in rows}
         return set(article_nos) - existing
 
-def mark_seen(category: str, items: list[dict]):
+# 수정 4: list[dict] -> List[Dict[str, Any]]
+def mark_seen(category: str, items: List[Dict[str, Any]]):
     """items: [{'id':..., 'title':...}, ...]"""
     if not items:
         return

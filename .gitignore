@@ -1,0 +1,10 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+seen.json.bak
+guild_channels.json.bak
+.DS_Store
+venv/
+__pycache__/
