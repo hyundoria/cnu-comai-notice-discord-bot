@@ -22,7 +22,7 @@
    docker build -t cnu-notice-bot .
 
    # 컨테이너 실행
-  docker run -d \
+   docker run -d \
     --name <컨테이너 이름> \
     -v $(pwd)/bot.db:/app/bot.db \
     --restart always \
