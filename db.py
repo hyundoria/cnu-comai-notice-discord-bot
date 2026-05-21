@@ -6,7 +6,9 @@ from pathlib import Path
 # 파이썬 3.8 호환을 위해 typing 모듈에서 필요한 타입들을 모두 불러옵니다.
 from typing import Optional, List, Tuple, Set, Dict, Any
 
-DB_PATH = Path(__file__).parent / "bot.db"
+DB_DIR = Path(__file__).parent / "data"
+DB_DIR.mkdir(exist_ok=True) # 폴더가 없으면 자동으로 생성
+DB_PATH = DB_DIR / "bot.db"ㅎ
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guild_channels (

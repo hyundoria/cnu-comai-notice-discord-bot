@@ -1,5 +1,5 @@
-# 1. 파이썬 3.8 슬림 버전을 베이스 이미지로 사용
-FROM python:3.8-slim
+# 1. 마이크로소프트의 Playwright 공식 파이썬 이미지를 베이스로 사용
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 # 2. 작업 디렉토리 설정
 WORKDIR /app
