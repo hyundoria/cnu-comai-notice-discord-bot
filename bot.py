@@ -3,7 +3,6 @@
 import os
 import re
 import json
-import time
 import asyncio
 import traceback
 from datetime import date, datetime, timedelta, timezone
@@ -212,10 +211,14 @@ async def fetch_and_parse_cyber_campus():
 
 # ---------- 메인 루프 ----------
 
-_last_cyber_run = 0.0
+# 시계 차이로 비교하면 주기 간격(600s)과 임계값(1800s)이 정확히 맞물려 지터에 흔들린다.
+# 몇 번째 주기인지를 세는 편이 결정적이다.
+_cyber_cycle = 0
 
 async def _crawl_once():
-    global _last_cyber_run
+    global _cyber_cycle
+    cycle = _cyber_cycle
+    _cyber_cycle += 1
     broadcasts = []      # [(category, article_no, embed), ...]
     
     # 1. 기존 일반 웹사이트 크롤링 (aiohttp)
@@ -256,9 +259,8 @@ async def _crawl_once():
 
     # 2. 사이버 캠퍼스 크롤링 (Playwright)
     cyber_items = []
-    now = time.monotonic()
-    if now - _last_cyber_run >= CYBER_CHECK_MIN * 60:
-        _last_cyber_run = now
+    cyber_every = max(1, round(CYBER_CHECK_MIN / CHECK_MIN))
+    if cycle % cyber_every == 0:
         try:
             cyber_items = await asyncio.wait_for(
                 fetch_and_parse_cyber_campus(), timeout=CYBER_TIMEOUT_SEC
