@@ -3,6 +3,8 @@
 import os
 import re
 import json
+import time
+import asyncio
 import traceback
 from datetime import date, datetime, timedelta, timezone
 import aiohttp
@@ -22,6 +24,11 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 ID = os.environ["ID"]
 PW = os.environ["PW"]
 CHECK_MIN = 10
+# 사이버캠퍼스는 Chromium을 띄워야 해서 비싸다. 공지 게시판보다 성기게 확인한다.
+CYBER_CHECK_MIN = 30
+# 한 주기가 영원히 멈추는 것을 막기 위한 상한(초). CHECK_MIN 주기보다 반드시 짧게 둔다.
+CYBER_TIMEOUT_SEC = 180   # 사이버캠퍼스 크롤 1회 상한
+CRAWL_TIMEOUT_SEC = 420   # 크롤 주기 전체 상한
 CHANNEL_NAME = "공지알림"
 KST = timezone(timedelta(hours=9))  # 마감일 판단은 한국 시간 기준
 
@@ -193,14 +200,22 @@ async def fetch_and_parse_cyber_campus():
         except Exception as e:
             print(f"사이버 캠퍼스 크롤링 실패: {e}")
         finally:
-            await browser.close()
+            # context를 닫지 않으면 크롬 자식 프로세스가 남는다. 정리 자체가 멈출 수도 있어 상한을 둔다.
+            for closer in (context.close, browser.close):
+                try:
+                    await asyncio.wait_for(closer(), timeout=30)
+                except Exception as e:
+                    print(f"playwright 정리 실패(무시): {e!r}")
             
     return items
 
 
 # ---------- 메인 루프 ----------
 
+_last_cyber_run = 0.0
+
 async def _crawl_once():
+    global _last_cyber_run
     broadcasts = []      # [(category, article_no, embed), ...]
     
     # 1. 기존 일반 웹사이트 크롤링 (aiohttp)
@@ -240,7 +255,16 @@ async def _crawl_once():
             db.trim_old(cat, keep=500)
 
     # 2. 사이버 캠퍼스 크롤링 (Playwright)
-    cyber_items = await fetch_and_parse_cyber_campus()
+    cyber_items = []
+    now = time.monotonic()
+    if now - _last_cyber_run >= CYBER_CHECK_MIN * 60:
+        _last_cyber_run = now
+        try:
+            cyber_items = await asyncio.wait_for(
+                fetch_and_parse_cyber_campus(), timeout=CYBER_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            print(f"⚠️ 사이버캠퍼스 크롤이 {CYBER_TIMEOUT_SEC}초를 넘겨 중단했습니다.")
     cat_cyber = "사이버캠퍼스 Todo"
     
     if cyber_items:
@@ -281,9 +305,11 @@ async def _crawl_once():
 
 @tasks.loop(minutes=CHECK_MIN)
 async def crawl():
-    # 한 주기에서 예기치 못한 예외가 나도 루프가 죽지 않고 다음 주기로 계속 진행되도록 감싼다.
+    # 한 주기에서 예외가 나도, 또 응답 없이 멈춰도(행) 루프가 다음 주기로 계속 가도록 감싼다.
     try:
-        await _crawl_once()
+        await asyncio.wait_for(_crawl_once(), timeout=CRAWL_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        print(f"⚠️ crawl 주기가 {CRAWL_TIMEOUT_SEC}초를 넘겨 중단했습니다. 다음 주기에 계속합니다.")
     except Exception as e:
         print(f"⚠️ crawl 주기 실패, 다음 주기에 계속합니다: {e!r}")
         traceback.print_exc()
