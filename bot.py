@@ -251,10 +251,20 @@ async def fetch_and_parse_cyber_campus():
             await page.fill('input[name="user_password"]', PW)
 
             # 로그인은 AJAX라 클릭 직후엔 페이지가 그대로다(networkidle 대기는 즉시 끝나 버린다).
-            # 로그인 응답을 직접 받아 학교 서버가 준 결과를 확인한다.
-            async with page.expect_response(lambda r: '/user/apiCnuAuthLogin' in r.url, timeout=30000) as info:
-                await page.click('button[data-act="clickLogin"]')
-            res = await (await info.value).json()
+            # 성공하면 JS가 곧장 페이지를 옮겨 응답 본문이 사라지므로, 브라우저에 넘기기 전에 가로채 읽는다.
+            login_res = asyncio.get_running_loop().create_future()
+            async def capture(route):
+                resp = await route.fetch()
+                try:
+                    if not login_res.done():
+                        login_res.set_result(await resp.json())
+                except Exception as e:
+                    if not login_res.done():
+                        login_res.set_exception(e)
+                await route.fulfill(response=resp)
+            await page.route(lambda u: '/user/apiCnuAuthLogin' in u, capture)
+            await page.click('button[data-act="clickLogin"]')
+            res = await asyncio.wait_for(login_res, timeout=30)
             header = res.get('header') or {}
             if str(header.get('code')) != '200':
                 msg = f"로그인 거부({header.get('code')}): {header.get('msg')}"
@@ -266,39 +276,34 @@ async def fetch_and_parse_cyber_campus():
                 raise RuntimeError(f"로그인 후 진행 불가: {blocked[ret]}")
             await page.wait_for_url(lambda u: '/login' not in u, timeout=20000)
 
-            # 2. Todo(공지) 페이지로 이동
+            # 2. Todo(공지) 페이지로 이동 — 표 데이터는 AJAX라 networkidle까지 기다린다
             await page.goto(todo_URL, wait_until='networkidle')
             # 세션이 안 잡혔으면 예외 없이 로그인 페이지로 돌려보내져 '할 일 없음'처럼 보인다.
             if 'login' in page.url:
                 raise RuntimeError(f"로그인 실패로 보임 (도착 URL: {page.url})")
-            # 표는 AJAX로 채워진다. 행이나 '항목 없음' 표시 중 하나가 뜰 때까지 기다린다.
-            await page.wait_for_selector('.tabulator-row, .tabulator-placeholder', timeout=20000)
+            await page.wait_for_function(
+                "() => window.Tabulator && document.querySelectorAll('.tabulator').length > 0",
+                timeout=20000,
+            )
 
-            # 3. HTML 파싱
-            html = await page.content()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            todo_rows = soup.select('.tabulator-row') 
-            
-            for row in todo_rows:
-                # 고유 ID 추출 (db에서 중복 방지용)
-                id_el = row.select_one('div[tabulator-field="rseq"]')
-                course_el = row.select_one('div[tabulator-field="course_nm"]')
-                title_el = row.select_one('div[tabulator-field="boarditem_title"]')
-                
-                if id_el and title_el:
-                    item_id = id_el.get_text(strip=True)
-                    course_name = course_el.get_text(strip=True) if course_el else "사이버캠퍼스"
-                    title_text = title_el.get_text(strip=True)
-                    
-                    items.append({
-                        'id': f"todo_{item_id}",
-                        # 디스코드 알림 제목에 과목명을 함께 표시합니다.
-                        'title': f"[{course_name}] {title_text}", 
-                        'link': todo_URL,
-                        'sticky': False
-                    })
-                    
+            # 3. 표(공지 noticeList, Q&A qnaList)의 원본 데이터를 읽는다.
+            # 화면의 '번호'(rseq)는 26, 25, …로 매기는 순번이고 표마다 따로라 고유 ID로 못 쓴다.
+            # 빈 표는 '항목 없음' 표시도 없어서 화면 HTML 대신 데이터로 판단한다.
+            rows = await page.evaluate("""() => [...document.querySelectorAll('.tabulator')].flatMap(el => {
+                const t = Tabulator.findTable(el)[0];
+                return t ? t.getData().map(d => ({...d, _table: el.id})) : [];
+            })""")
+            for d in rows:
+                uid = d.get('boarditem_no') or f"{d['_table']}-{d.get('course_id')}-{d.get('rseq')}"
+                kind = "Q&A · " if d['_table'] == 'qnaList' else ""
+                items.append({
+                    'id': f"todo_{uid}",
+                    # 디스코드 알림 제목에 과목명을 함께 표시합니다.
+                    'title': f"[{d.get('course_nm') or '사이버캠퍼스'}] {kind}{d.get('boarditem_title', '')}",
+                    'link': todo_URL,
+                    'sticky': False
+                })
+
         except Exception as e:
             print(f"사이버 캠퍼스 크롤링 실패: {e}")
             raise   # 호출 쪽에서 실패로 기록한다
