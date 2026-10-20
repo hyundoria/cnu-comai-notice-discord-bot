@@ -42,6 +42,11 @@ CATEGORIES = {
 cyber_campus_URL = "https://dcs-lcms.cnu.ac.kr/login"
 todo_URL = "https://dcs-learning.cnu.ac.kr/std/todo"
 
+# 학식 (생협 모바일 식단 페이지: 날짜 하나에 식당들이 열로 나오는 표)
+MENU_URL = "https://mobileadmin.cnu.ac.kr/food/index.jsp"
+MENU_CACHE_SEC = 600   # 점심시간 동시 조회로 학교 서버를 두드리지 않도록 날짜별로 잠시 캐시
+CAFETERIAS = ["제1학생회관", "제2학생회관", "제3학생회관", "제4학생회관", "생활과학대학"]
+
 
 # 디스코드 클라이언트 초기화
 intents = discord.Intents.default()
@@ -144,6 +149,71 @@ def extract_deadline(title: str):
     if not cands:
         return None
     return cands[-1].isoformat()  # 가장 뒤의 날짜를 마감일로 본다
+
+# ---------- 학식 메뉴 ----------
+_menu_cache = {}   # 'YYYY.MM.DD' -> (fetched_at, parsed)
+
+def parse_menu(html):
+    """식단 표를 {식당: {'menus': [{'meal','target','title','items'}], 'link': url|None}}로."""
+    soup = BeautifulSoup(html, 'html.parser')
+    table = soup.select_one('table.menu-tbl')
+    if not table:
+        return {}
+    names = [th.get_text(strip=True) for th in table.select('thead th')][1:]  # 첫 칸은 '구분'
+    out = {n: {'menus': [], 'link': None} for n in names}
+
+    # 제1학생회관은 rowspan으로 모든 행을 덮는 '메뉴운영내역' 링크(외부 페이지)만 있다.
+    m = re.search(r"const url = '([^']+)'", html)
+    ext_link = m.group(1) if m else MENU_URL
+
+    pending = [0] * len(names)   # 열마다 위 행의 rowspan이 아직 덮고 있는 행 수
+    meal = ''
+    for tr in table.select('tbody > tr'):
+        tds = tr.find_all('td', recursive=False)
+        if tds and 'building' in (tds[0].get('class') or []):
+            meal = tds[0].get_text(strip=True)
+            tds = tds[1:]
+        if not tds:
+            continue
+        target, cells = tds[0].get_text(strip=True), iter(tds[1:])
+        for i, name in enumerate(names):
+            if pending[i]:
+                pending[i] -= 1
+                continue
+            td = next(cells, None)
+            if td is None:
+                break
+            pending[i] = int(td.get('rowspan', 1)) - 1
+            if td.select_one('a[onclick*="openWindow"]'):
+                out[name]['link'] = ext_link
+                continue
+            for li in td.select('li'):
+                h3, p = li.select_one('h3'), li.select_one('p')
+                items = [s for s in (p.get_text('\n', strip=True).split('\n') if p else []) if s]
+                out[name]['menus'].append({
+                    'meal': meal, 'target': target,
+                    'title': h3.get_text(strip=True) if h3 else '',
+                    'items': items,
+                })
+    return out
+
+async def fetch_menu(day: date):
+    key = day.strftime('%Y.%m.%d')
+    now = asyncio.get_running_loop().time()
+    hit = _menu_cache.get(key)
+    if hit and now - hit[0] < MENU_CACHE_SEC:
+        return hit[1]
+    params = {'searchYmd': key, 'searchLang': 'OCL04.10', 'searchView': 'cafeteria'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(MENU_URL, params=params, timeout=aiohttp.ClientTimeout(total=15),
+                               headers={'User-Agent': 'Mozilla/5.0'}) as r:
+            r.raise_for_status()
+            parsed = parse_menu(await r.text())
+    # 날짜가 바뀌며 쌓이지 않게 만료된 항목은 버린다
+    for k in [k for k, (t, _) in _menu_cache.items() if now - t >= MENU_CACHE_SEC]:
+        del _menu_cache[k]
+    _menu_cache[key] = (now, parsed)
+    return parsed
 
 # 사이버 캠퍼스 Playwright 비동기 접근 및 파싱
 async def fetch_and_parse_cyber_campus():
@@ -408,6 +478,50 @@ async def deadline_cmd(interaction: discord.Interaction):
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="학식", description="충남대 학생식당 메뉴를 봅니다.")
+@discord.app_commands.describe(날짜="조회할 날짜 (기본: 오늘)", 식당="특정 식당만 보기 (기본: 전체)")
+@discord.app_commands.choices(
+    날짜=[discord.app_commands.Choice(name=n, value=i) for i, n in enumerate(("오늘", "내일", "모레"))],
+    식당=[discord.app_commands.Choice(name=n, value=n) for n in CAFETERIAS],
+)
+async def menu_cmd(interaction: discord.Interaction,
+                   날짜: discord.app_commands.Choice[int] = None,
+                   식당: discord.app_commands.Choice[str] = None):
+    # 학교 서버가 느리면 3초 응답 제한을 넘기므로 먼저 defer한다.
+    await interaction.response.defer(ephemeral=True)
+    day = _today_kst() + timedelta(days=날짜.value if 날짜 else 0)
+    try:
+        menu = await fetch_menu(day)
+    except Exception as e:
+        print(f"학식 조회 실패: {e!r}")
+        await interaction.followup.send("학식 정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+        return
+
+    weekday = "월화수목금토일"[day.weekday()]
+    embed = discord.Embed(title=f"🍚 {day.isoformat()}({weekday}) 학식", url=MENU_URL, color=0x27AE60)
+    for name, info in menu.items():
+        if 식당 and name != 식당.value:
+            continue
+        if info['menus']:
+            blocks = [
+                f"**{m['meal']}·{m['target']}** {m['title']}\n" + " · ".join(m['items'])
+                for m in info['menus']
+            ]
+            value = "\n".join(blocks)
+            if len(value) > 1024:   # 임베드 필드 값 상한
+                value = value[:1023] + "…"
+        elif info['link']:
+            value = f"[메뉴운영내역 보기]({info['link']})"
+        else:
+            continue
+        embed.add_field(name=name, value=value, inline=False)
+
+    # 제1학생회관 링크는 날짜와 무관하게 항상 있으므로, 실제 메뉴가 있었는지로 판단한다.
+    if not any(info['menus'] for name, info in menu.items() if not 식당 or name == 식당.value):
+        where = f"{식당.value}은(는) " if 식당 else ""
+        embed.description = f"{where}운영하지 않거나 식단이 아직 등록되지 않았습니다."
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ---------- 이벤트 ----------
 
