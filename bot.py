@@ -75,7 +75,7 @@ async def ensure_channel(guild: discord.Guild):
 
     try:
         ch = await guild.create_text_channel(
-            CHANNEL_NAME, topic="충남대 컴공지능 및 사이버캠퍼스 공지 자동 알림",
+            CHANNEL_NAME, topic="충남대 컴퓨터인공지능학부 공지 자동 알림",
             reason="공지 봇 초기 설정"
         )
         db.upsert_guild_channel(guild.id, ch.id)
@@ -300,7 +300,8 @@ async def _crawl_once():
     global _cyber_cycle
     cycle = _cyber_cycle
     _cyber_cycle += 1
-    broadcasts = []      # [(category, article_no, embed), ...]
+    broadcasts = []      # [(category, article_no, embed), ...] — 모든 서버 알림 채널로
+    owner_dms = []       # 같은 형식 — 개인 계정 정보(사이버캠퍼스)라 봇 소유자 DM으로만
     
     # 1. 기존 일반 웹사이트 크롤링 (aiohttp)
     async with aiohttp.ClientSession() as session:
@@ -371,12 +372,16 @@ async def _crawl_once():
                     title=n['title'], url=n['link'],
                     description=f"**[{cat_cyber}]** 새로운 알림이 있습니다.", color=0xE74C3C # 사이버캠퍼스는 눈에 띄게 빨간색
                 )
-                broadcasts.append((cat_cyber, n['id'], embed))
+                # 공개 봇이라 누가 초대하든 그 서버 채널에 내 과목·과제가 올라가면 안 된다.
+                owner_dms.append((cat_cyber, n['id'], embed))
 
             db.mark_seen(cat_cyber, new_items)
             db.trim_old(cat_cyber, keep=500)
 
     # 3. 디스코드로 메시지 전송
+    for cat, art_no, embed in owner_dms:
+        db.log_notification(cat, art_no, 0, await _notify_owner(embed=embed))   # guild_id 0 = 소유자 DM
+
     if not broadcasts:
         return
 
@@ -438,13 +443,15 @@ def _stale_sources(statuses):
             out.append(src)
     return out
 
-async def _notify_owner(text: str):
+async def _notify_owner(text: str = None, embed: discord.Embed = None) -> bool:
     try:
         app = await client.application_info()
         owner = app.team.owner if app.team else app.owner
-        await owner.send(text)
+        await owner.send(text, embed=embed)
+        return True
     except Exception as e:
         print(f"소유자 DM 실패: {e!r}")
+        return False
 
 @tasks.loop(minutes=15)
 async def health_check():
@@ -687,7 +694,7 @@ async def on_guild_join(guild: discord.Guild):
     if ch:
         welcome_embed = discord.Embed(
             title="🤖 공지 알림 봇이 추가되었습니다!",
-            description=f"앞으로 일반 공지와 사이버 캠퍼스 알림을 전달해 드릴게요.\n자동으로 {CHECK_MIN}분마다 업데이트됩니다.",
+            description=f"앞으로 학부 공지를 이 채널로 전달해 드릴게요.\n자동으로 {CHECK_MIN}분마다 업데이트됩니다.",
             color=0x2ECC71
         )
         await ch.send(embed=welcome_embed)
