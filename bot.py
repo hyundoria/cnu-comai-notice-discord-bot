@@ -45,7 +45,9 @@ todo_URL = "https://dcs-learning.cnu.ac.kr/std/todo"
 # 학식 (생협 모바일 식단 페이지: 날짜 하나에 식당들이 열로 나오는 표)
 MENU_URL = "https://mobileadmin.cnu.ac.kr/food/index.jsp"
 MENU_CACHE_SEC = 600   # 점심시간 동시 조회로 학교 서버를 두드리지 않도록 날짜별로 잠시 캐시
-CAFETERIAS = ["제1학생회관", "제2학생회관", "제3학생회관", "제4학생회관", "생활과학대학"]
+# 사이트 표 머리글(정식 이름) -> 디스코드에 보일 줄임말
+CAFETERIAS = {"제1학생회관": "1학", "제2학생회관": "2학", "제3학생회관": "3학",
+              "제4학생회관": "4학", "생활과학대학": "생과대"}
 
 
 # 디스코드 클라이언트 초기화
@@ -483,7 +485,7 @@ async def deadline_cmd(interaction: discord.Interaction):
 @discord.app_commands.describe(날짜="조회할 날짜 (기본: 오늘)", 식당="특정 식당만 보기 (기본: 전체)")
 @discord.app_commands.choices(
     날짜=[discord.app_commands.Choice(name=n, value=i) for i, n in enumerate(("오늘", "내일", "모레"))],
-    식당=[discord.app_commands.Choice(name=n, value=n) for n in CAFETERIAS],
+    식당=[discord.app_commands.Choice(name=short, value=n) for n, short in CAFETERIAS.items()],
 )
 async def menu_cmd(interaction: discord.Interaction,
                    날짜: discord.app_commands.Choice[int] = None,
@@ -515,11 +517,11 @@ async def menu_cmd(interaction: discord.Interaction,
             value = f"[메뉴운영내역 보기]({info['link']})"
         else:
             continue
-        embed.add_field(name=name, value=value, inline=False)
+        embed.add_field(name=CAFETERIAS.get(name, name), value=value, inline=False)
 
     # 제1학생회관 링크는 날짜와 무관하게 항상 있으므로, 실제 메뉴가 있었는지로 판단한다.
     if not any(info['menus'] for name, info in menu.items() if not 식당 or name == 식당.value):
-        where = f"{식당.value}은(는) " if 식당 else ""
+        where = f"{식당.name}은(는) " if 식당 else ""
         embed.description = f"{where}운영하지 않거나 식단이 아직 등록되지 않았습니다."
     await interaction.followup.send(embed=embed, ephemeral=True)
 
