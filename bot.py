@@ -222,6 +222,12 @@ async def fetch_menu(day: date):
     _menu_cache[key] = (now, parsed)
     return parsed
 
+class CyberAuthError(RuntimeError):
+    """학교 서버가 아이디·비밀번호가 틀렸다고 답함. 계속 재시도하면 포털 계정이 잠길 수 있다."""
+
+# 설정되면 재시작(.env 수정 후) 전까지 사이버캠퍼스 로그인을 다시 시도하지 않는다.
+_cyber_auth_error = None
+
 # 사이버 캠퍼스 Playwright 비동기 접근 및 파싱
 async def fetch_and_parse_cyber_campus():
     items = []
@@ -235,21 +241,38 @@ async def fetch_and_parse_cyber_campus():
         try:
             # 1. 로그인 페이지 이동
             await page.goto(cyber_campus_URL)
-            
-            # 💡 [TODO] 아래 선택자(selector)를 실제 사이트에 맞게 수정하세요.
-            await page.fill('input[name="user_id"]', ID) 
+            # 페이지 JS가 소속 대학(CNU)과 통합로그인(포털 비밀번호) 체크를 채운 뒤에 눌러야 한다.
+            await page.wait_for_function(
+                "() => document.loginForm && document.loginForm.univ_no.value === 'CNU'"
+                " && document.querySelector('#cnu_auth')?.checked",
+                timeout=15000,
+            )
+            await page.fill('input[name="user_id"]', ID)
             await page.fill('input[name="user_password"]', PW)
-            await page.click('button[data-act="clickLogin"]')
-            
-            # 로그인 처리가 완료될 때까지 대기
-            await page.wait_for_load_state('networkidle')
+
+            # 로그인은 AJAX라 클릭 직후엔 페이지가 그대로다(networkidle 대기는 즉시 끝나 버린다).
+            # 로그인 응답을 직접 받아 학교 서버가 준 결과를 확인한다.
+            async with page.expect_response(lambda r: '/user/apiCnuAuthLogin' in r.url, timeout=30000) as info:
+                await page.click('button[data-act="clickLogin"]')
+            res = await (await info.value).json()
+            header = res.get('header') or {}
+            if str(header.get('code')) != '200':
+                msg = f"로그인 거부({header.get('code')}): {header.get('msg')}"
+                raise (CyberAuthError if str(header.get('code')) == '2003' else RuntimeError)(msg)
+            ret = str((res.get('body') or {}).get('ret_code'))
+            blocked = {"0": "개인정보 약관 동의 필요 — 브라우저로 한 번 로그인해 동의하세요",
+                       "-1": "미승인 사용자", "-2": "초기 비밀번호 변경 필요"}
+            if ret in blocked:
+                raise RuntimeError(f"로그인 후 진행 불가: {blocked[ret]}")
+            await page.wait_for_url(lambda u: '/login' not in u, timeout=20000)
 
             # 2. Todo(공지) 페이지로 이동
-            await page.goto(todo_URL)
-            await page.wait_for_load_state('networkidle')
-            # 로그인이 깨지면 예외 없이 로그인 페이지로 돌려보내져 '할 일 없음'처럼 보인다.
+            await page.goto(todo_URL, wait_until='networkidle')
+            # 세션이 안 잡혔으면 예외 없이 로그인 페이지로 돌려보내져 '할 일 없음'처럼 보인다.
             if 'login' in page.url:
                 raise RuntimeError(f"로그인 실패로 보임 (도착 URL: {page.url})")
+            # 표는 AJAX로 채워진다. 행이나 '항목 없음' 표시 중 하나가 뜰 때까지 기다린다.
+            await page.wait_for_selector('.tabulator-row, .tabulator-placeholder', timeout=20000)
 
             # 3. HTML 파싱
             html = await page.content()
@@ -297,7 +320,7 @@ async def fetch_and_parse_cyber_campus():
 _cyber_cycle = 0
 
 async def _crawl_once():
-    global _cyber_cycle
+    global _cyber_cycle, _cyber_auth_error
     cycle = _cyber_cycle
     _cyber_cycle += 1
     broadcasts = []      # [(category, article_no, embed), ...] — 모든 서버 알림 채널로
@@ -347,12 +370,21 @@ async def _crawl_once():
     # 2. 사이버 캠퍼스 크롤링 (Playwright)
     cyber_items = []
     cyber_every = max(1, round(CYBER_CHECK_MIN / CHECK_MIN))
-    if cycle % cyber_every == 0:
+    if cycle % cyber_every == 0 and _cyber_auth_error:
+        db.record_crawl(CYBER_CAT, False, f"{_cyber_auth_error} (잠금 방지로 재시도 중단 — .env 수정 후 재시작)")
+    elif cycle % cyber_every == 0:
         try:
             cyber_items = await asyncio.wait_for(
                 fetch_and_parse_cyber_campus(), timeout=CYBER_TIMEOUT_SEC
             )
             db.record_crawl(CYBER_CAT, True)
+        except CyberAuthError as e:
+            _cyber_auth_error = str(e)
+            db.record_crawl(CYBER_CAT, False, f"{e} (잠금 방지로 재시도 중단 — .env 수정 후 재시작)")
+            await _notify_owner(
+                f"🔒 사이버캠퍼스 로그인 실패: {e}\n포털 계정이 잠기지 않도록 재시작 전까지 로그인을 다시 시도하지 않습니다.\n"
+                "서버의 `.env`에서 `ID`/`PW`를 고친 뒤 컨테이너를 다시 띄워 주세요."
+            )
         except asyncio.TimeoutError:
             print(f"⚠️ 사이버캠퍼스 크롤이 {CYBER_TIMEOUT_SEC}초를 넘겨 중단했습니다.")
             db.record_crawl(CYBER_CAT, False, f"{CYBER_TIMEOUT_SEC}초 시간 초과")
