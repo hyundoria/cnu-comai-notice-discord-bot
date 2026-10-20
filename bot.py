@@ -595,21 +595,24 @@ def _upcoming_meal(now: datetime):
             return 0, meal
     return 1, "중식"
 
-@tree.command(name="학식", description="충남대 학생식당 메뉴를 봅니다. (옵션 없이 쓰면 다음 끼니)")
-@discord.app_commands.describe(날짜="조회할 날짜", 식당="특정 식당만 보기 (기본: 전체)", 끼니="특정 끼니만 보기")
+@tree.command(name="학식", description="충남대 학생식당 메뉴를 봅니다. (예: /학식 2학, /학식 전체)")
+@discord.app_commands.describe(식당="볼 식당 (전체 가능)", 날짜="조회할 날짜 (기본: 다음 끼니)", 끼니="특정 끼니만 보기")
 @discord.app_commands.choices(
+    # 식당을 첫 번째 '필수' 옵션으로 둬야 '/학식 2학'처럼 옵션 이름 없이 바로 입력된다.
+    식당=[discord.app_commands.Choice(name="전체", value="전체")] +
+         [discord.app_commands.Choice(name=short, value=n) for n, short in CAFETERIAS.items()],
     날짜=[discord.app_commands.Choice(name=n, value=v) for n, v in MENU_DAY_CHOICES],
-    식당=[discord.app_commands.Choice(name=short, value=n) for n, short in CAFETERIAS.items()],
     끼니=[discord.app_commands.Choice(name=m, value=m) for m in (*MEALS, "전체")],
 )
 async def menu_cmd(interaction: discord.Interaction,
+                   식당: discord.app_commands.Choice[str],
                    날짜: discord.app_commands.Choice[str] = None,
-                   식당: discord.app_commands.Choice[str] = None,
                    끼니: discord.app_commands.Choice[str] = None):
     # 학교 서버가 느리면 3초 응답 제한을 넘기므로 먼저 defer한다.
     await interaction.response.defer(ephemeral=True)
     today = _today_kst()
-    auto = 날짜 is None and 끼니 is None   # 아무것도 안 고르면 다음 끼니를 자동으로
+    auto = 날짜 is None and 끼니 is None   # 날짜·끼니를 안 고르면 다음 끼니를 자동으로
+    only = None if 식당.value == "전체" else 식당.value
     if auto:
         offset, meal = _upcoming_meal(datetime.now(KST))
         day = today + timedelta(days=offset)
@@ -626,7 +629,7 @@ async def menu_cmd(interaction: discord.Interaction,
     def pick(info, meal):
         return [m for m in info['menus'] if not meal or m['meal'] == meal]
 
-    targets = {n: info for n, info in menu.items() if not 식당 or n == 식당.value}
+    targets = {n: info for n, info in menu.items() if not only or n == only}
     # 자동으로 고른 끼니를 운영하는 곳이 없으면(예: 석식) 그날 전체를 보여준다.
     if auto and not any(pick(info, meal) for info in targets.values()):
         meal = None
@@ -652,7 +655,7 @@ async def menu_cmd(interaction: discord.Interaction,
 
     # 제1학생회관 링크는 날짜와 무관하게 항상 있으므로, 실제 메뉴가 있었는지로 판단한다.
     if not any(pick(info, meal) for info in targets.values()):
-        where = f"{식당.name}은(는) " if 식당 else ""
+        where = f"{식당.name}은(는) " if only else ""
         embed.description = f"{where}운영하지 않거나 식단이 아직 등록되지 않았습니다."
     if auto and meal:
         embed.set_footer(text="지금 시각 기준 다음 끼니만 표시 · 끼니:전체로 모두 보기")
