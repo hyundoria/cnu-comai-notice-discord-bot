@@ -5,7 +5,7 @@ import re
 import json
 import asyncio
 import traceback
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 import aiohttp
 import db
 from urllib.parse import urljoin
@@ -23,18 +23,21 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 ID = os.environ["ID"]
 PW = os.environ["PW"]
 CHECK_MIN = 10
-# 사이버캠퍼스는 Chromium을 띄워야 해서 비싸다. 공지 게시판보다 성기게 확인한다.
-CYBER_CHECK_MIN = 30
+KST = timezone(timedelta(hours=9))  # 마감일 판단은 한국 시간 기준
+# 사이버캠퍼스는 Chromium을 띄우고 포털 계정으로 로그인해야 해서 비싸다. 정해진 시각에만 확인한다.
+CYBER_TIMES = [dtime(13, 0, tzinfo=KST), dtime(18, 0, tzinfo=KST)]
 # 한 주기가 영원히 멈추는 것을 막기 위한 상한(초). CHECK_MIN 주기보다 반드시 짧게 둔다.
 CYBER_TIMEOUT_SEC = 180   # 사이버캠퍼스 크롤 1회 상한
 CRAWL_TIMEOUT_SEC = 420   # 크롤 주기 전체 상한
 # 이 시간 동안 한 번도 성공하지 못한 크롤 소스가 있으면 봇 소유자에게 DM으로 알린다.
 # 학교 사이트 야간 점검에 울리지 않도록 크롤 주기보다 넉넉하게 둔다.
 STALE_ALERT_MIN = 180
-CYBER_CAT = "사이버캠퍼스 Todo"
+CYBER_STALE_MIN = 26 * 60   # 사이버캠퍼스는 하루 두 번만 돌므로 하루+여유
 CRAWL_LOOP = "크롤 주기"   # 주기 전체가 끝까지 돌았는지(행 감지용)
+CYBER_SRC = "사이버캠퍼스"            # /상태용: 로그인~수집 전체의 성공 여부
+CYBER_NOTICE = "사이버캠퍼스 공지"     # 알림 카테고리(본 글 기록·통계)
+CYBER_REPORT = "사이버캠퍼스 과제"
 CHANNEL_NAME = "공지알림"
-KST = timezone(timedelta(hours=9))  # 마감일 판단은 한국 시간 기준
 
 CATEGORIES = {
     "학사공지":   "https://comai.cnu.ac.kr/computer/notice/bachelor.do",
@@ -230,7 +233,8 @@ _cyber_auth_error = None
 
 # 사이버 캠퍼스 Playwright 비동기 접근 및 파싱
 async def fetch_and_parse_cyber_campus():
-    items = []
+    """{CYBER_NOTICE: [...], CYBER_REPORT: [...]} — 로그인·수집 중 하나라도 실패하면 예외."""
+    found = {CYBER_NOTICE: [], CYBER_REPORT: []}
     # async_playwright를 컨텍스트 매니저로 실행
     async with async_playwright() as p:
         # headless=True로 설정하여 백그라운드에서 실행 (서버 배포 시 필수)
@@ -276,32 +280,43 @@ async def fetch_and_parse_cyber_campus():
                 raise RuntimeError(f"로그인 후 진행 불가: {blocked[ret]}")
             await page.wait_for_url(lambda u: '/login' not in u, timeout=20000)
 
-            # 2. Todo(공지) 페이지로 이동 — 표 데이터는 AJAX라 networkidle까지 기다린다
+            # 2. To-Do 페이지로 이동 — 학기 정보와 API 호출 함수(comm)가 이 페이지에서 준비된다
             await page.goto(todo_URL, wait_until='networkidle')
             # 세션이 안 잡혔으면 예외 없이 로그인 페이지로 돌려보내져 '할 일 없음'처럼 보인다.
             if 'login' in page.url:
                 raise RuntimeError(f"로그인 실패로 보임 (도착 URL: {page.url})")
+            # 3. 페이지는 학기 → 강의 → 목록 순으로 AJAX를 이어 불러서, networkidle 직후 표가 아직 빌 수 있다.
+            # 화면 표를 읽지 않고 페이지가 쓰는 API 호출 함수(comm.send)를 같은 인자로 직접 부른다.
             await page.wait_for_function(
-                "() => window.Tabulator && document.querySelectorAll('.tabulator').length > 0",
-                timeout=20000,
+                "() => window.comm && document.querySelector('#currentYearTerm')?.getAttribute('data-val')",
+                timeout=15000,
             )
+            call = """([url, extra]) => new Promise((resolve, reject) => {
+                const [term_year, term_cd] = document.querySelector('#currentYearTerm').getAttribute('data-val').split('/');
+                comm.send(url, {term_year, term_cd, ...extra}, 'post', data => resolve(data || {}),
+                          err => reject(new Error(url + ' 실패: ' + ((err && (err.msg || err.code)) || ''))));
+            })"""
 
-            # 3. 표(공지 noticeList, Q&A qnaList)의 원본 데이터를 읽는다.
-            # 화면의 '번호'(rseq)는 26, 25, …로 매기는 순번이고 표마다 따로라 고유 ID로 못 쓴다.
-            # 빈 표는 '항목 없음' 표시도 없어서 화면 HTML 대신 데이터로 판단한다.
-            rows = await page.evaluate("""() => [...document.querySelectorAll('.tabulator')].flatMap(el => {
-                const t = Tabulator.findTable(el)[0];
-                return t ? t.getData().map(d => ({...d, _table: el.id})) : [];
-            })""")
-            for d in rows:
-                uid = d.get('boarditem_no') or f"{d['_table']}-{d.get('course_id')}-{d.get('rseq')}"
-                kind = "Q&A · " if d['_table'] == 'qnaList' else ""
-                items.append({
-                    'id': f"todo_{uid}",
+            # 공지사항. 화면의 '번호'(rseq)는 26, 25, …로 매기는 순번이라 고유 ID로 못 쓴다.
+            notices = await page.evaluate(call, ['/board/std/notice/list', {'type': 'notice', 'limit': 20, 'offset': 0}])
+            for d in notices.get('list') or []:
+                found[CYBER_NOTICE].append({
+                    'id': f"notice_{d.get('boarditem_no') or d.get('course_id', '') + '-' + str(d.get('rseq'))}",
                     # 디스코드 알림 제목에 과목명을 함께 표시합니다.
-                    'title': f"[{d.get('course_nm') or '사이버캠퍼스'}] {kind}{d.get('boarditem_title', '')}",
+                    'title': f"[{d.get('course_nm') or '사이버캠퍼스'}] {d.get('boarditem_title', '')}",
                     'link': todo_URL,
-                    'sticky': False
+                })
+
+            # 4. '진행 가능'(P) 학습요소 중 과제(LR)
+            todo = (await page.evaluate(call, ['/week/getStdTodoList', {'to_do_type': 'P'}])).get('todo_list') or []
+            for d in todo:
+                if d.get('module_type') != 'LR':   # LR=과제 (LV 콘텐츠, LS 자료실, LQ 퀴즈 …)
+                    continue
+                found[CYBER_REPORT].append({
+                    'id': f"report_{d.get('item_id') or d.get('contents_id')}",
+                    'title': f"[{d.get('course_nm') or '사이버캠퍼스'}] {d.get('item_title_temp', '')}",
+                    'link': todo_URL,
+                    'due': (d.get('info') or '')[:16],   # 'YYYY-MM-DD HH:MM'
                 })
 
         except Exception as e:
@@ -314,22 +329,14 @@ async def fetch_and_parse_cyber_campus():
                     await asyncio.wait_for(closer(), timeout=30)
                 except Exception as e:
                     print(f"playwright 정리 실패(무시): {e!r}")
-            
-    return items
+
+    return found
 
 
 # ---------- 메인 루프 ----------
 
-# 시계 차이로 비교하면 주기 간격(600s)과 임계값(1800s)이 정확히 맞물려 지터에 흔들린다.
-# 몇 번째 주기인지를 세는 편이 결정적이다.
-_cyber_cycle = 0
-
 async def _crawl_once():
-    global _cyber_cycle, _cyber_auth_error
-    cycle = _cyber_cycle
-    _cyber_cycle += 1
     broadcasts = []      # [(category, article_no, embed), ...] — 모든 서버 알림 채널로
-    owner_dms = []       # 같은 형식 — 개인 계정 정보(사이버캠퍼스)라 봇 소유자 DM으로만
     
     # 1. 기존 일반 웹사이트 크롤링 (aiohttp)
     async with aiohttp.ClientSession() as session:
@@ -372,53 +379,7 @@ async def _crawl_once():
             db.mark_seen(cat, new_items)
             db.trim_old(cat, keep=500)
 
-    # 2. 사이버 캠퍼스 크롤링 (Playwright)
-    cyber_items = []
-    cyber_every = max(1, round(CYBER_CHECK_MIN / CHECK_MIN))
-    if cycle % cyber_every == 0 and _cyber_auth_error:
-        db.record_crawl(CYBER_CAT, False, f"{_cyber_auth_error} (잠금 방지로 재시도 중단 — .env 수정 후 재시작)")
-    elif cycle % cyber_every == 0:
-        try:
-            cyber_items = await asyncio.wait_for(
-                fetch_and_parse_cyber_campus(), timeout=CYBER_TIMEOUT_SEC
-            )
-            db.record_crawl(CYBER_CAT, True)
-        except CyberAuthError as e:
-            _cyber_auth_error = str(e)
-            db.record_crawl(CYBER_CAT, False, f"{e} (잠금 방지로 재시도 중단 — .env 수정 후 재시작)")
-            await _notify_owner(
-                f"🔒 사이버캠퍼스 로그인 실패: {e}\n포털 계정이 잠기지 않도록 재시작 전까지 로그인을 다시 시도하지 않습니다.\n"
-                "서버의 `.env`에서 `ID`/`PW`를 고친 뒤 컨테이너를 다시 띄워 주세요."
-            )
-        except asyncio.TimeoutError:
-            print(f"⚠️ 사이버캠퍼스 크롤이 {CYBER_TIMEOUT_SEC}초를 넘겨 중단했습니다.")
-            db.record_crawl(CYBER_CAT, False, f"{CYBER_TIMEOUT_SEC}초 시간 초과")
-        except Exception as e:
-            db.record_crawl(CYBER_CAT, False, repr(e))
-    cat_cyber = CYBER_CAT
-    
-    if cyber_items:
-        if db.is_baseline_empty(cat_cyber):
-            db.mark_seen(cat_cyber, cyber_items)
-        else:
-            new_ids = db.filter_new(cat_cyber, [n['id'] for n in cyber_items])
-            new_items = [n for n in cyber_items if n['id'] in new_ids]
-
-            for n in reversed(new_items):
-                embed = discord.Embed(
-                    title=n['title'], url=n['link'],
-                    description=f"**[{cat_cyber}]** 새로운 알림이 있습니다.", color=0xE74C3C # 사이버캠퍼스는 눈에 띄게 빨간색
-                )
-                # 공개 봇이라 누가 초대하든 그 서버 채널에 내 과목·과제가 올라가면 안 된다.
-                owner_dms.append((cat_cyber, n['id'], embed))
-
-            db.mark_seen(cat_cyber, new_items)
-            db.trim_old(cat_cyber, keep=500)
-
-    # 3. 디스코드로 메시지 전송
-    for cat, art_no, embed in owner_dms:
-        db.log_notification(cat, art_no, 0, await _notify_owner(embed=embed))   # guild_id 0 = 소유자 DM
-
+    # 2. 디스코드로 메시지 전송
     if not broadcasts:
         return
 
@@ -459,6 +420,70 @@ async def crawl_error(error: Exception):
     if not crawl.is_running():
         crawl.restart()
 
+# ---------- 사이버캠퍼스 루프 (매일 정해진 시각) ----------
+
+def _take_new(category, items):
+    """처음 본 항목만 돌려주고 기록한다. 첫 수집은 기준선으로만 저장(기존 항목 폭탄 방지).
+    과제처럼 빈 목록이 흔한 곳은 첫 수집이 0건이어도 기준선을 남겨야, 이후 첫 과제를 놓치지 않는다."""
+    if db.is_baseline_empty(category):
+        db.mark_seen(category, [{'id': '_baseline', 'title': ''}, *items])
+        return []
+    new_ids = db.filter_new(category, [n['id'] for n in items])
+    new_items = [n for n in items if n['id'] in new_ids]
+    db.mark_seen(category, new_items)
+    db.trim_old(category, keep=500)
+    return new_items
+
+async def _cyber_once():
+    global _cyber_auth_error
+    if _cyber_auth_error:
+        db.record_crawl(CYBER_SRC, False, f"{_cyber_auth_error} (잠금 방지로 재시도 중단 — .env 수정 후 재시작)")
+        return
+    try:
+        found = await asyncio.wait_for(fetch_and_parse_cyber_campus(), timeout=CYBER_TIMEOUT_SEC)
+        db.record_crawl(CYBER_SRC, True)
+    except CyberAuthError as e:
+        _cyber_auth_error = str(e)
+        db.record_crawl(CYBER_SRC, False, f"{e} (잠금 방지로 재시도 중단 — .env 수정 후 재시작)")
+        await _notify_owner(
+            f"🔒 사이버캠퍼스 로그인 실패: {e}\n포털 계정이 잠기지 않도록 재시작 전까지 로그인을 다시 시도하지 않습니다.\n"
+            "서버의 `.env`에서 `ID`/`PW`를 고친 뒤 컨테이너를 다시 띄워 주세요."
+        )
+        return
+    except asyncio.TimeoutError:
+        print(f"⚠️ 사이버캠퍼스 크롤이 {CYBER_TIMEOUT_SEC}초를 넘겨 중단했습니다.")
+        db.record_crawl(CYBER_SRC, False, f"{CYBER_TIMEOUT_SEC}초 시간 초과")
+        return
+    except Exception as e:
+        db.record_crawl(CYBER_SRC, False, repr(e))
+        return
+
+    # 개인 수강 정보다. 공개 봇이라 누가 초대한 서버 채널에도 올라가면 안 되므로 소유자 DM으로만 보낸다.
+    for cat in (CYBER_NOTICE, CYBER_REPORT):
+        for n in reversed(_take_new(cat, found[cat])):
+            if cat == CYBER_REPORT:
+                desc = f"**[{cat}]** 새 과제가 열렸습니다." + (f"\n⏰ 마감 **{n['due']}**" if n.get('due') else "")
+                embed = discord.Embed(title=f"📝 {n['title']}", url=n['link'], description=desc, color=0x9B59B6)
+            else:
+                embed = discord.Embed(title=n['title'], url=n['link'],
+                                      description=f"**[{cat}]** 새 공지가 올라왔습니다.", color=0xE74C3C)
+            db.log_notification(cat, n['id'], 0, await _notify_owner(embed=embed))   # guild_id 0 = 소유자 DM
+
+@tasks.loop(time=CYBER_TIMES)
+async def cyber_crawl():
+    try:
+        await _cyber_once()
+    except Exception as e:
+        print(f"⚠️ cyber_crawl 실패: {e!r}")
+        traceback.print_exc()
+
+@cyber_crawl.before_loop
+async def _before_cyber_crawl():
+    await client.wait_until_ready()
+    # 기준선이 없으면 첫 정시 실행까지 올라온 글이 기준선에 묻혀 알림이 안 간다. 처음 한 번만 바로 잡아 둔다.
+    if any(db.is_baseline_empty(c) for c in (CYBER_NOTICE, CYBER_REPORT)):
+        await _cyber_once()
+
 # ---------- 이상 감지 루프 ----------
 
 # 디스코드엔 초록불인데 크롤만 조용히 멈추는 경우(예: PID 고갈로 인한 행)를 잡기 위한 것.
@@ -467,16 +492,19 @@ _started_at = datetime.now(timezone.utc)
 _alerted = set()   # 이미 알린 소스(복구되면 빠진다)
 
 def _monitored_sources():
-    return [CRAWL_LOOP, *CATEGORIES, CYBER_CAT]
+    return [CRAWL_LOOP, *CATEGORIES, CYBER_SRC]
+
+def _stale_limit(src):
+    return CYBER_STALE_MIN if src == CYBER_SRC else STALE_ALERT_MIN
 
 def _stale_sources(statuses):
-    """STALE_ALERT_MIN 동안 성공이 없는 소스 목록. 재시작 직후 오탐을 막으려 기동 시각도 기준에 넣는다."""
+    """소스별 기준 시간 동안 성공이 없는 소스 목록. 재시작 직후 오탐을 막으려 기동 시각도 기준에 넣는다."""
     now = datetime.now(timezone.utc)
     out = []
     for src in _monitored_sources():
         last_ok = (statuses.get(src) or {}).get("last_ok")
         since = max(_started_at, datetime.fromisoformat(last_ok)) if last_ok else _started_at
-        if now - since > timedelta(minutes=STALE_ALERT_MIN):
+        if now - since > timedelta(minutes=_stale_limit(src)):
             out.append(src)
     return out
 
@@ -498,7 +526,7 @@ async def health_check():
         for src in sorted(stale - _alerted):
             err = (statuses.get(src) or {}).get("last_error") or "기록된 오류 없음"
             await _notify_owner(
-                f"⚠️ **{src}** 크롤이 {STALE_ALERT_MIN // 60}시간 넘게 한 번도 성공하지 못했습니다.\n"
+                f"⚠️ **{src}** 크롤이 {_stale_limit(src) // 60}시간 넘게 한 번도 성공하지 못했습니다.\n"
                 f"마지막 오류: `{err}`\n`/상태`로 전체 현황을 볼 수 있습니다."
             )
         for src in sorted(_alerted - stale):
@@ -565,7 +593,9 @@ async def status_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🩺 봇 상태",
         description=(f"기동 {discord.utils.format_dt(_started_at, 'R')} · 서버 {len(client.guilds)}개\n"
-                     f"{STALE_ALERT_MIN // 60}시간 넘게 성공이 없으면 ⚠️로 표시합니다."),
+                     f"{STALE_ALERT_MIN // 60}시간(사이버캠퍼스는 {CYBER_STALE_MIN // 60}시간) 넘게 성공이 없으면 ⚠️로 표시합니다."
+                     + (f"\n사이버캠퍼스 다음 확인 {discord.utils.format_dt(cyber_crawl.next_iteration, 'R')}"
+                        if cyber_crawl.next_iteration else "")),
         color=0xE67E22 if stale else 0x2ECC71,
     )
     for src in _monitored_sources():
@@ -724,6 +754,8 @@ async def on_ready():
         deadline_reminder.start()
     if not health_check.is_running():
         health_check.start()
+    if not cyber_crawl.is_running():
+        cyber_crawl.start()
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
