@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS deadlines (
     created_at    TEXT    NOT NULL,
     PRIMARY KEY (category, article_no)
 );
+CREATE TABLE IF NOT EXISTS crawl_status (
+    source      TEXT PRIMARY KEY,   -- 카테고리 이름 또는 '크롤 주기'
+    last_ok     TEXT,
+    last_fail   TEXT,
+    last_error  TEXT
+);
 """
 
 def _now():
@@ -226,3 +232,25 @@ def trim_old_deadlines(before_date: str):
     """마감이 지난 지 오래된 항목 정리."""
     with connect() as c:
         c.execute("DELETE FROM deadlines WHERE deadline_date < ?", (before_date,))
+# ---------- crawl_status (/상태 명령·이상 감지용) ----------
+def record_crawl(source: str, ok: bool, error: Optional[str] = None):
+    """성공이면 last_ok를, 실패면 last_fail·last_error를 갱신한다."""
+    with connect() as c:
+        if ok:
+            c.execute("""
+                INSERT INTO crawl_status(source, last_ok) VALUES(?, ?)
+                ON CONFLICT(source) DO UPDATE SET last_ok=excluded.last_ok
+            """, (source, _now()))
+        else:
+            c.execute("""
+                INSERT INTO crawl_status(source, last_fail, last_error) VALUES(?, ?, ?)
+                ON CONFLICT(source) DO UPDATE
+                  SET last_fail=excluded.last_fail, last_error=excluded.last_error
+            """, (source, _now(), (error or "")[:300]))
+
+def crawl_statuses() -> Dict[str, Dict[str, Any]]:
+    with connect() as c:
+        rows = c.execute(
+            "SELECT source, last_ok, last_fail, last_error FROM crawl_status"
+        ).fetchall()
+        return {r["source"]: dict(r) for r in rows}

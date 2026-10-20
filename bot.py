@@ -28,6 +28,11 @@ CYBER_CHECK_MIN = 30
 # 한 주기가 영원히 멈추는 것을 막기 위한 상한(초). CHECK_MIN 주기보다 반드시 짧게 둔다.
 CYBER_TIMEOUT_SEC = 180   # 사이버캠퍼스 크롤 1회 상한
 CRAWL_TIMEOUT_SEC = 420   # 크롤 주기 전체 상한
+# 이 시간 동안 한 번도 성공하지 못한 크롤 소스가 있으면 봇 소유자에게 DM으로 알린다.
+# 학교 사이트 야간 점검에 울리지 않도록 크롤 주기보다 넉넉하게 둔다.
+STALE_ALERT_MIN = 180
+CYBER_CAT = "사이버캠퍼스 Todo"
+CRAWL_LOOP = "크롤 주기"   # 주기 전체가 끝까지 돌았는지(행 감지용)
 CHANNEL_NAME = "공지알림"
 KST = timezone(timedelta(hours=9))  # 마감일 판단은 한국 시간 기준
 
@@ -242,6 +247,9 @@ async def fetch_and_parse_cyber_campus():
             # 2. Todo(공지) 페이지로 이동
             await page.goto(todo_URL)
             await page.wait_for_load_state('networkidle')
+            # 로그인이 깨지면 예외 없이 로그인 페이지로 돌려보내져 '할 일 없음'처럼 보인다.
+            if 'login' in page.url:
+                raise RuntimeError(f"로그인 실패로 보임 (도착 URL: {page.url})")
 
             # 3. HTML 파싱
             html = await page.content()
@@ -270,6 +278,7 @@ async def fetch_and_parse_cyber_campus():
                     
         except Exception as e:
             print(f"사이버 캠퍼스 크롤링 실패: {e}")
+            raise   # 호출 쪽에서 실패로 기록한다
         finally:
             # context를 닫지 않으면 크롬 자식 프로세스가 남는다. 정리 자체가 멈출 수도 있어 상한을 둔다.
             for closer in (context.close, browser.close):
@@ -301,9 +310,14 @@ async def _crawl_once():
                 items = parse_general(html, url)
             except Exception as e:
                 print(f"crawl fail {cat}: {e}")
+                db.record_crawl(cat, False, repr(e))
                 continue
-            
-            if not items: continue
+
+            # 게시판이 비어 있을 리는 없으니, 빈 목록은 페이지 구조가 바뀐 것으로 본다.
+            if not items:
+                db.record_crawl(cat, False, "게시글 목록을 찾지 못함 (페이지 구조 변경?)")
+                continue
+            db.record_crawl(cat, True)
             
             if db.is_baseline_empty(cat):
                 db.mark_seen(cat, items)
@@ -337,9 +351,13 @@ async def _crawl_once():
             cyber_items = await asyncio.wait_for(
                 fetch_and_parse_cyber_campus(), timeout=CYBER_TIMEOUT_SEC
             )
+            db.record_crawl(CYBER_CAT, True)
         except asyncio.TimeoutError:
             print(f"⚠️ 사이버캠퍼스 크롤이 {CYBER_TIMEOUT_SEC}초를 넘겨 중단했습니다.")
-    cat_cyber = "사이버캠퍼스 Todo"
+            db.record_crawl(CYBER_CAT, False, f"{CYBER_TIMEOUT_SEC}초 시간 초과")
+        except Exception as e:
+            db.record_crawl(CYBER_CAT, False, repr(e))
+    cat_cyber = CYBER_CAT
     
     if cyber_items:
         if db.is_baseline_empty(cat_cyber):
@@ -382,11 +400,14 @@ async def crawl():
     # 한 주기에서 예외가 나도, 또 응답 없이 멈춰도(행) 루프가 다음 주기로 계속 가도록 감싼다.
     try:
         await asyncio.wait_for(_crawl_once(), timeout=CRAWL_TIMEOUT_SEC)
+        db.record_crawl(CRAWL_LOOP, True)
     except asyncio.TimeoutError:
         print(f"⚠️ crawl 주기가 {CRAWL_TIMEOUT_SEC}초를 넘겨 중단했습니다. 다음 주기에 계속합니다.")
+        db.record_crawl(CRAWL_LOOP, False, f"{CRAWL_TIMEOUT_SEC}초 시간 초과")
     except Exception as e:
         print(f"⚠️ crawl 주기 실패, 다음 주기에 계속합니다: {e!r}")
         traceback.print_exc()
+        db.record_crawl(CRAWL_LOOP, False, repr(e))
 
 @crawl.error
 async def crawl_error(error: Exception):
@@ -395,6 +416,58 @@ async def crawl_error(error: Exception):
     traceback.print_exc()
     if not crawl.is_running():
         crawl.restart()
+
+# ---------- 이상 감지 루프 ----------
+
+# 디스코드엔 초록불인데 크롤만 조용히 멈추는 경우(예: PID 고갈로 인한 행)를 잡기 위한 것.
+# 크롤 루프와 별개 태스크라서 크롤이 멈춰도 이 루프는 돈다.
+_started_at = datetime.now(timezone.utc)
+_alerted = set()   # 이미 알린 소스(복구되면 빠진다)
+
+def _monitored_sources():
+    return [CRAWL_LOOP, *CATEGORIES, CYBER_CAT]
+
+def _stale_sources(statuses):
+    """STALE_ALERT_MIN 동안 성공이 없는 소스 목록. 재시작 직후 오탐을 막으려 기동 시각도 기준에 넣는다."""
+    now = datetime.now(timezone.utc)
+    out = []
+    for src in _monitored_sources():
+        last_ok = (statuses.get(src) or {}).get("last_ok")
+        since = max(_started_at, datetime.fromisoformat(last_ok)) if last_ok else _started_at
+        if now - since > timedelta(minutes=STALE_ALERT_MIN):
+            out.append(src)
+    return out
+
+async def _notify_owner(text: str):
+    try:
+        app = await client.application_info()
+        owner = app.team.owner if app.team else app.owner
+        await owner.send(text)
+    except Exception as e:
+        print(f"소유자 DM 실패: {e!r}")
+
+@tasks.loop(minutes=15)
+async def health_check():
+    try:
+        statuses = db.crawl_statuses()
+        stale = set(_stale_sources(statuses))
+        for src in sorted(stale - _alerted):
+            err = (statuses.get(src) or {}).get("last_error") or "기록된 오류 없음"
+            await _notify_owner(
+                f"⚠️ **{src}** 크롤이 {STALE_ALERT_MIN // 60}시간 넘게 한 번도 성공하지 못했습니다.\n"
+                f"마지막 오류: `{err}`\n`/상태`로 전체 현황을 볼 수 있습니다."
+            )
+        for src in sorted(_alerted - stale):
+            await _notify_owner(f"✅ **{src}** 크롤이 다시 정상입니다.")
+        _alerted.clear()
+        _alerted.update(stale)
+    except Exception as e:
+        print(f"⚠️ health_check 실패: {e!r}")
+        traceback.print_exc()
+
+@health_check.before_loop
+async def _before_health_check():
+    await client.wait_until_ready()
 
 # ---------- 마감 리마인더 루프 ----------
 
@@ -441,6 +514,28 @@ async def _before_deadline_reminder():
 
 # ---------- 슬래시 커맨드 ----------
 
+@tree.command(name="상태", description="공지 크롤링이 정상적으로 돌고 있는지 봅니다.")
+async def status_cmd(interaction: discord.Interaction):
+    statuses = db.crawl_statuses()
+    stale = set(_stale_sources(statuses))
+    embed = discord.Embed(
+        title="🩺 봇 상태",
+        description=(f"기동 {discord.utils.format_dt(_started_at, 'R')} · 서버 {len(client.guilds)}개\n"
+                     f"{STALE_ALERT_MIN // 60}시간 넘게 성공이 없으면 ⚠️로 표시합니다."),
+        color=0xE67E22 if stale else 0x2ECC71,
+    )
+    for src in _monitored_sources():
+        st = statuses.get(src) or {}
+        last_ok, last_fail = st.get("last_ok"), st.get("last_fail")
+        lines = [f"마지막 성공 {discord.utils.format_dt(datetime.fromisoformat(last_ok), 'R')}"
+                 if last_ok else "아직 성공 기록 없음"]
+        # 마지막 성공 이후에 난 실패만 보여준다(이미 복구된 옛 오류는 생략).
+        if last_fail and (not last_ok or last_fail > last_ok):
+            lines.append(f"실패 {discord.utils.format_dt(datetime.fromisoformat(last_fail), 'R')}: "
+                         f"`{(st.get('last_error') or '')[:150]}`")
+        embed.add_field(name=f"{'⚠️' if src in stale else '✅'} {src}", value="\n".join(lines), inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @tree.command(name="통계", description="공지 전송 통계와 감지 현황을 봅니다.")
 async def stats_cmd(interaction: discord.Interaction):
     s = db.notification_stats(days=7)
@@ -481,18 +576,46 @@ async def deadline_cmd(interaction: discord.Interaction):
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@tree.command(name="학식", description="충남대 학생식당 메뉴를 봅니다.")
-@discord.app_commands.describe(날짜="조회할 날짜 (기본: 오늘)", 식당="특정 식당만 보기 (기본: 전체)")
+# 날짜 선택지: 상대 날짜(+N일) 또는 요일(오늘 포함 가장 가까운 그 요일)
+MENU_DAY_CHOICES = [("오늘", "+0"), ("내일", "+1"), ("모레", "+2")] + \
+                   [(f"{w}요일", f"w{i}") for i, w in enumerate("월화수목금토")]
+MEALS = ("조식", "중식", "석식")
+# 끼니가 끝나는 시각(KST). 옵션 없이 부르면 아직 안 끝난 첫 끼니를 보여준다.
+MEAL_ENDS = ((9, 30), (14, 0), (19, 0))
+
+def _menu_day(choice: str, today: date) -> date:
+    if choice.startswith("w"):
+        return today + timedelta(days=(int(choice[1:]) - today.weekday()) % 7)
+    return today + timedelta(days=int(choice))
+
+def _upcoming_meal(now: datetime):
+    """(날짜 오프셋, 끼니). 석식까지 끝났으면 내일 중식."""
+    for meal, (h, m) in zip(MEALS, MEAL_ENDS):
+        if (now.hour, now.minute) < (h, m):
+            return 0, meal
+    return 1, "중식"
+
+@tree.command(name="학식", description="충남대 학생식당 메뉴를 봅니다. (옵션 없이 쓰면 다음 끼니)")
+@discord.app_commands.describe(날짜="조회할 날짜", 식당="특정 식당만 보기 (기본: 전체)", 끼니="특정 끼니만 보기")
 @discord.app_commands.choices(
-    날짜=[discord.app_commands.Choice(name=n, value=i) for i, n in enumerate(("오늘", "내일", "모레"))],
+    날짜=[discord.app_commands.Choice(name=n, value=v) for n, v in MENU_DAY_CHOICES],
     식당=[discord.app_commands.Choice(name=short, value=n) for n, short in CAFETERIAS.items()],
+    끼니=[discord.app_commands.Choice(name=m, value=m) for m in (*MEALS, "전체")],
 )
 async def menu_cmd(interaction: discord.Interaction,
-                   날짜: discord.app_commands.Choice[int] = None,
-                   식당: discord.app_commands.Choice[str] = None):
+                   날짜: discord.app_commands.Choice[str] = None,
+                   식당: discord.app_commands.Choice[str] = None,
+                   끼니: discord.app_commands.Choice[str] = None):
     # 학교 서버가 느리면 3초 응답 제한을 넘기므로 먼저 defer한다.
     await interaction.response.defer(ephemeral=True)
-    day = _today_kst() + timedelta(days=날짜.value if 날짜 else 0)
+    today = _today_kst()
+    auto = 날짜 is None and 끼니 is None   # 아무것도 안 고르면 다음 끼니를 자동으로
+    if auto:
+        offset, meal = _upcoming_meal(datetime.now(KST))
+        day = today + timedelta(days=offset)
+    else:
+        day = _menu_day(날짜.value, today) if 날짜 else today
+        meal = 끼니.value if 끼니 and 끼니.value != "전체" else None
     try:
         menu = await fetch_menu(day)
     except Exception as e:
@@ -500,15 +623,23 @@ async def menu_cmd(interaction: discord.Interaction,
         await interaction.followup.send("학식 정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
         return
 
+    def pick(info, meal):
+        return [m for m in info['menus'] if not meal or m['meal'] == meal]
+
+    targets = {n: info for n, info in menu.items() if not 식당 or n == 식당.value}
+    # 자동으로 고른 끼니를 운영하는 곳이 없으면(예: 석식) 그날 전체를 보여준다.
+    if auto and not any(pick(info, meal) for info in targets.values()):
+        meal = None
+
     weekday = "월화수목금토일"[day.weekday()]
-    embed = discord.Embed(title=f"🍚 {day.isoformat()}({weekday}) 학식", url=MENU_URL, color=0x27AE60)
-    for name, info in menu.items():
-        if 식당 and name != 식당.value:
-            continue
-        if info['menus']:
+    title = " ".join(filter(None, ("🍚", f"{day.isoformat()}({weekday})", meal, "학식")))
+    embed = discord.Embed(title=title, url=MENU_URL, color=0x27AE60)
+    for name, info in targets.items():
+        menus = pick(info, meal)
+        if menus:
             blocks = [
                 f"**{m['meal']}·{m['target']}** {m['title']}\n" + " · ".join(m['items'])
-                for m in info['menus']
+                for m in menus
             ]
             value = "\n".join(blocks)
             if len(value) > 1024:   # 임베드 필드 값 상한
@@ -520,9 +651,11 @@ async def menu_cmd(interaction: discord.Interaction,
         embed.add_field(name=CAFETERIAS.get(name, name), value=value, inline=False)
 
     # 제1학생회관 링크는 날짜와 무관하게 항상 있으므로, 실제 메뉴가 있었는지로 판단한다.
-    if not any(info['menus'] for name, info in menu.items() if not 식당 or name == 식당.value):
+    if not any(pick(info, meal) for info in targets.values()):
         where = f"{식당.name}은(는) " if 식당 else ""
         embed.description = f"{where}운영하지 않거나 식단이 아직 등록되지 않았습니다."
+    if auto and meal:
+        embed.set_footer(text="지금 시각 기준 다음 끼니만 표시 · 끼니:전체로 모두 보기")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ---------- 이벤트 ----------
@@ -542,6 +675,8 @@ async def on_ready():
         crawl.start()
     if not deadline_reminder.is_running():
         deadline_reminder.start()
+    if not health_check.is_running():
+        health_check.start()
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
