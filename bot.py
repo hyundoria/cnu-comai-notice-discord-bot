@@ -682,8 +682,8 @@ async def menu_cmd(interaction: discord.Interaction,
                    식당: discord.app_commands.Choice[str],
                    날짜: discord.app_commands.Choice[str] = None,
                    끼니: discord.app_commands.Choice[str] = None):
-    # 학교 서버가 느리면 3초 응답 제한을 넘기므로 먼저 defer한다.
-    await interaction.response.defer(ephemeral=True)
+    # 학교 서버가 느리면 3초 응답 제한을 넘기므로 먼저 defer한다. 메뉴는 채널에 공개로 올린다.
+    await interaction.response.defer()
     today = _today_kst()
     auto = 날짜 is None and 끼니 is None   # 날짜·끼니를 안 고르면 다음 끼니를 자동으로
     only = None if 식당.value == "전체" else 식당.value
@@ -697,7 +697,7 @@ async def menu_cmd(interaction: discord.Interaction,
         menu = await fetch_menu(day)
     except Exception as e:
         print(f"학식 조회 실패: {e!r}")
-        await interaction.followup.send("학식 정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+        await interaction.followup.send("학식 정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")
         return
 
     def pick(info, meal):
@@ -733,7 +733,7 @@ async def menu_cmd(interaction: discord.Interaction,
         embed.description = f"{where}운영하지 않거나 식단이 아직 등록되지 않았습니다."
     if auto and meal:
         embed.set_footer(text="지금 시각 기준 다음 끼니만 표시 · 끼니:전체로 모두 보기")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 # ---------- 이벤트 ----------
 
