@@ -50,6 +50,12 @@ CATEGORIES = {
 cyber_campus_URL = "https://dcs-lcms.cnu.ac.kr/login"
 todo_URL = "https://dcs-learning.cnu.ac.kr/std/todo"
 
+# 비교과 (CNU with U+): 목록 페이지는 포털 2차 인증을 거쳐야 열려서 봇이 로그인할 수 없다.
+# 대신 비로그인 메인 화면의 '신규 비교과 프로그램' 위젯과 상세 팝업은 로그인 없이 열린다.
+WITH_BASE = "https://with.cnu.ac.kr"
+WITH_LIST_URL = WITH_BASE + "/ptfol/imng/icmpNsbjtPgm/findIcmpNsbjtPgmList.do"
+WITH_SRC = "비교과"
+
 # 학식 (생협 모바일 식단 페이지: 날짜 하나에 식당들이 열로 나오는 표)
 MENU_URL = "https://mobileadmin.cnu.ac.kr/food/index.jsp"
 MENU_CACHE_SEC = 600   # 점심시간 동시 조회로 학교 서버를 두드리지 않도록 날짜별로 잠시 캐시
@@ -333,6 +339,85 @@ async def fetch_and_parse_cyber_campus():
     return found
 
 
+# ---------- 비교과 (CNU with U+) ----------
+
+def parse_with_programs(html):
+    """메인 화면 '신규 비교과 프로그램' 위젯의 카드 목록. id는 상세 팝업 키(세션과 무관하게 고정)."""
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    for li in soup.select('.left_program li.program_tag'):
+        a = li.select_one('a[onclick]')
+        m = re.search(r"nonLogin\('([0-9a-f]+)'\)", a.get('onclick', '')) if a else None
+        if not m:
+            continue
+        def text(sel):
+            el = li.select_one(sel)
+            return el.get_text(' ', strip=True) if el else ''
+        items.append({
+            'id': m.group(1), 'title': text('.cprom_tit'), 'org': text('.cprom_tag'),
+            'apply': text('dl.date dd'), 'target': text('dl.target dd'), 'quota': text('dl.personnel dd'),
+        })
+    return items
+
+async def fetch_with_programs(session):
+    async with session.post(WITH_BASE + "/non/htmlAdd/addDiv.do", data={'addType': '0029'}, timeout=30,
+                            headers={'User-Agent': 'Mozilla/5.0', 'ajax': 'true'}) as r:
+        r.raise_for_status()
+        return parse_with_programs(await r.text())
+
+async def fetch_with_detail(session, enc_id):
+    """상세 팝업의 표를 {머리글: 값}으로. 교육기간처럼 회차마다 반복되는 항목은 첫 회차만 남긴다."""
+    async with session.get(WITH_BASE + "/ptfol/imng/icmpNsbjtPgm/dialog/findIcmpNsbjtPgmInfo.do",
+                           params={'encSddpbSeq': enc_id}, timeout=30,
+                           headers={'User-Agent': 'Mozilla/5.0', 'X-Requested-With': 'XMLHttpRequest'}) as r:
+        r.raise_for_status()
+        soup = BeautifulSoup(await r.text(), 'html.parser')
+    info = {}
+    for th in soup.find_all('th'):
+        td = th.find_next_sibling('td')
+        key = th.get_text(strip=True)
+        if td and key not in info:
+            info[key] = ' '.join(td.get_text(' ', strip=True).split())
+    return info
+
+def with_embed(item, info):
+    embed = discord.Embed(title=f"🎓 {item['title']}", url=WITH_LIST_URL,
+                          description=info.get('프로그램 한줄 소개') or None, color=0x16A085)
+    embed.set_author(name=f"새 비교과 프로그램 · {item['org']}")
+    edu = info.get('교육기간')
+    if edu and info.get('진행속성') not in (None, '', '1회'):
+        edu += f" ({info['진행속성']})"
+    # 학점·활동비·시상금·마일리지 중 0이 아닌 것만
+    support = [f"{k} {v}{u}" for k, v, u in re.findall(r'(\S+) - 최대 ([\d,.]+) (\S+)', info.get('지원내용', ''))
+               if v.strip('0.,')]
+    for name, value in (("신청기간", info.get('신청기간') or item['apply']), ("교육기간", edu),
+                        ("장소/강사", info.get('교육장소/강사')), ("대상", item['target']),
+                        ("정원", item['quota']), ("선정", info.get('선정방법')),
+                        ("인정시간", info.get('인정시간')), ("지원", ", ".join(support))):
+        if value:
+            embed.add_field(name=name, value=value[:1024], inline=name not in ("교육기간", "장소/강사"))
+    return embed
+
+async def _with_once(session):
+    """새 비교과 프로그램을 소유자 DM으로. 사용자가 개인 DM으로 받기를 원했다(채널 공지와 분리)."""
+    try:
+        programs = await fetch_with_programs(session)
+    except Exception as e:
+        print(f"crawl fail {WITH_SRC}: {e}")
+        db.record_crawl(WITH_SRC, False, repr(e))
+        return
+    if not programs:
+        db.record_crawl(WITH_SRC, False, "프로그램 목록을 찾지 못함 (페이지 구조 변경?)")
+        return
+    db.record_crawl(WITH_SRC, True)
+    for item in reversed(_take_new(WITH_SRC, programs)):
+        try:
+            info = await fetch_with_detail(session, item['id'])
+        except Exception as e:
+            print(f"비교과 상세 조회 실패 {item['id']}: {e!r}")
+            info = {}   # 상세를 못 읽어도 목록 카드 정보로는 알린다
+        db.log_notification(WITH_SRC, item['id'], 0, await _notify_owner(embed=with_embed(item, info)))
+
 # ---------- 메인 루프 ----------
 
 async def _crawl_once():
@@ -378,6 +463,8 @@ async def _crawl_once():
 
             db.mark_seen(cat, new_items)
             db.trim_old(cat, keep=500)
+
+        await _with_once(session)
 
     # 2. 디스코드로 메시지 전송
     if not broadcasts:
@@ -492,7 +579,7 @@ _started_at = datetime.now(timezone.utc)
 _alerted = set()   # 이미 알린 소스(복구되면 빠진다)
 
 def _monitored_sources():
-    return [CRAWL_LOOP, *CATEGORIES, CYBER_SRC]
+    return [CRAWL_LOOP, *CATEGORIES, WITH_SRC, CYBER_SRC]
 
 def _stale_limit(src):
     return CYBER_STALE_MIN if src == CYBER_SRC else STALE_ALERT_MIN
@@ -710,7 +797,12 @@ async def probe_cmd(interaction: discord.Interaction):
     def menu(html):
         return f"식당 {len(parse_menu(html))}곳"
 
+    def with_list(html):
+        n = len(parse_with_programs(html))
+        return f"신규 프로그램 {n}건" if n else None
+
     targets = {cat: (url, board, None) for cat, url in CATEGORIES.items()}
+    targets[WITH_SRC] = (WITH_BASE + "/non/htmlAdd/addDiv.do", with_list, {'addType': '0029'})
     targets["학식"] = (MENU_URL, menu, {'searchYmd': _today_kst().strftime('%Y.%m.%d'),
                                        'searchLang': 'OCL04.10', 'searchView': 'cafeteria'})
     # 사이버캠퍼스는 계정 잠금 위험이 있어 로그인하지 않고 로그인 페이지가 열리는지만 본다.
