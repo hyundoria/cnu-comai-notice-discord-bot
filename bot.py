@@ -341,22 +341,39 @@ async def fetch_and_parse_cyber_campus():
 
 # ---------- 비교과 (CNU with U+) ----------
 
+WITH_SECTIONS = (('.left_program li.program_tag', '신규'),
+                 ('.popDiv li', '인기순'), ('.endDiv li', '마감 임박순'))
+
 def parse_with_programs(html):
-    """메인 화면 '신규 비교과 프로그램' 위젯의 카드 목록. id는 상세 팝업 키(세션과 무관하게 고정)."""
+    """메인 화면 비교과 위젯의 왼쪽 '신규' 카드와 오른쪽 인기순·마감 임박순 목록.
+    신규 목록이 빠짐없이 최신순인지 확인할 길이 없어, 오른쪽 목록은 놓친 것을 잡는 보조로 함께 읽는다.
+    id는 상세 팝업 키(세션과 무관하게 고정)다. 마감 임박순 항목엔 그 키가 없어 제목으로 대신한다."""
     soup = BeautifulSoup(html, 'html.parser')
-    items = []
-    for li in soup.select('.left_program li.program_tag'):
-        a = li.select_one('a[onclick]')
-        m = re.search(r"nonLogin\('([0-9a-f]+)'\)", a.get('onclick', '')) if a else None
-        if not m:
-            continue
-        def text(sel):
-            el = li.select_one(sel)
-            return el.get_text(' ', strip=True) if el else ''
-        items.append({
-            'id': m.group(1), 'title': text('.cprom_tit'), 'org': text('.cprom_tag'),
-            'apply': text('dl.date dd'), 'target': text('dl.target dd'), 'quota': text('dl.personnel dd'),
-        })
+    items, seen = [], set()
+    for sel, section in WITH_SECTIONS:
+        for li in soup.select(sel):
+            def text(css):
+                el = li.select_one(css)
+                return el.get_text(' ', strip=True) if el else ''
+            a = li.select_one('a[onclick]')
+            m = re.search(r"nonLogin\('([0-9a-f]+)'\)", a.get('onclick', '')) if a else None
+            title = text('.cprom_tit') or text('dd h2')
+            if not title:
+                continue
+            item_id = m.group(1) if m else f"title:{title}"
+            # 같은 프로그램이 여러 목록에 나오면 먼저 읽은(정보가 많은 신규 카드) 쪽만 남긴다.
+            if item_id in seen or title in seen:
+                continue
+            seen.update((item_id, title))
+            if section == '신규':
+                items.append({'id': item_id, 'title': title, 'org': text('.cprom_tag'), 'section': section,
+                              'apply': text('dl.date dd'), 'target': text('dl.target dd'),
+                              'quota': text('dl.personnel dd')})
+            else:
+                applied = text('dd.application').replace('신청', '').strip()
+                items.append({'id': item_id, 'title': title, 'org': text('span.online'), 'section': section,
+                              'apply': ' '.join(text('dd.date').replace('접수', '').split()),
+                              'target': text('.cdDiv'), 'quota': f"신청 {applied}" if applied else ''})
     return items
 
 async def fetch_with_programs(session):
@@ -383,7 +400,8 @@ async def fetch_with_detail(session, enc_id):
 def with_embed(item, info):
     embed = discord.Embed(title=f"🎓 {item['title']}", url=WITH_LIST_URL,
                           description=info.get('프로그램 한줄 소개') or None, color=0x16A085)
-    embed.set_author(name=f"새 비교과 프로그램 · {item['org']}")
+    found_in = "" if item['section'] == '신규' else f" ({item['section']}에서 발견)"
+    embed.set_author(name=f"새 비교과 프로그램{found_in} · {item['org']}")
     edu = info.get('교육기간')
     if edu and info.get('진행속성') not in (None, '', '1회'):
         edu += f" ({info['진행속성']})"
@@ -392,7 +410,8 @@ def with_embed(item, info):
                if v.strip('0.,')]
     for name, value in (("신청기간", info.get('신청기간') or item['apply']), ("교육기간", edu),
                         ("장소/강사", info.get('교육장소/강사')), ("대상", item['target']),
-                        ("정원", item['quota']), ("선정", info.get('선정방법')),
+                        ("정원" if item['section'] == '신규' else "신청/정원", item['quota']),
+                        ("선정", info.get('선정방법')),
                         ("인정시간", info.get('인정시간')), ("지원", ", ".join(support))):
         if value:
             embed.add_field(name=name, value=value[:1024], inline=name not in ("교육기간", "장소/강사"))
@@ -411,11 +430,15 @@ async def _with_once(session):
         return
     db.record_crawl(WITH_SRC, True)
     for item in reversed(_take_new(WITH_SRC, programs)):
-        try:
-            info = await fetch_with_detail(session, item['id'])
-        except Exception as e:
-            print(f"비교과 상세 조회 실패 {item['id']}: {e!r}")
-            info = {}   # 상세를 못 읽어도 목록 카드 정보로는 알린다
+        # 마감 임박순(제목 id)으로 먼저 알린 프로그램이 나중에 키를 달고 나와도(또는 그 반대) 다시 알리지 않는다.
+        if db.title_seen_elsewhere(WITH_SRC, item['title'], item['id']):
+            continue
+        info = {}   # 상세를 못 읽어도 목록 카드 정보로는 알린다
+        if not item['id'].startswith('title:'):
+            try:
+                info = await fetch_with_detail(session, item['id'])
+            except Exception as e:
+                print(f"비교과 상세 조회 실패 {item['id']}: {e!r}")
         db.log_notification(WITH_SRC, item['id'], 0, await _notify_owner(embed=with_embed(item, info)))
 
 # ---------- 메인 루프 ----------

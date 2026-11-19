@@ -134,6 +134,15 @@ def mark_seen(category: str, items: List[Dict[str, Any]]):
             VALUES(?, ?, ?, ?)
         """, [(category, n['id'], n.get('title',''), now) for n in items])
 
+def title_seen_elsewhere(category: str, title: str, article_no: str) -> bool:
+    """같은 제목을 다른 article_no로 이미 본 적이 있는지."""
+    with connect() as c:
+        row = c.execute(
+            "SELECT 1 FROM seen_articles WHERE category=? AND title=? AND article_no<>? LIMIT 1",
+            (category, title, article_no)
+        ).fetchone()
+        return row is not None
+
 def trim_old(category: str, keep: int = 500):
     """카테고리당 최신 keep개만 유지."""
     with connect() as c:
