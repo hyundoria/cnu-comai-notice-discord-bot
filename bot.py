@@ -650,6 +650,98 @@ async def deadline_cmd(interaction: discord.Interaction):
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+PROBE_TIMEOUT_SEC = 15
+PROBE_COOLDOWN_SEC = 30   # 여러 번 눌러 학교 서버를 두드리지 않도록
+_last_probe = None
+
+def _proc_counts():
+    """컨테이너 안 (전체 프로세스 수, 좀비 수). /proc가 없으면(리눅스 아님) None."""
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return None
+    zombies = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                # 형식: pid (이름) 상태 ... — 이름에 공백·괄호가 있을 수 있어 마지막 ')' 뒤를 본다
+                if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    zombies += 1
+        except (OSError, IndexError):
+            pass   # 그 사이 종료된 프로세스
+    return len(pids), zombies
+
+async def _probe(session, url, parse=None, params=None):
+    """(성공 여부, 설명) — 지금 바로 요청해 보고 응답 시간을 잰다. DB에는 기록하지 않는다."""
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT_SEC),
+                               headers={'User-Agent': 'Mozilla/5.0'}) as r:
+            html = await r.text()
+            ms = round((loop.time() - t0) * 1000)
+            if r.status != 200:
+                return False, f"HTTP {r.status} · {ms}ms"
+    except Exception as e:
+        return False, f"접속 실패: `{e!r}`"[:200]
+    if not parse:
+        return True, f"{ms}ms"
+    try:
+        detail = parse(html)
+    except Exception as e:
+        return False, f"{ms}ms · 읽기 실패: `{e!r}`"[:200]
+    return detail is not None, f"{ms}ms · {detail or '내용을 찾지 못함 (페이지 구조 변경?)'}"
+
+@tree.command(name="점검", description="학교 사이트에 지금 바로 접속되는지와 봇 내부 상태를 확인합니다.")
+async def probe_cmd(interaction: discord.Interaction):
+    global _last_probe
+    now = datetime.now(timezone.utc)
+    if _last_probe and now - _last_probe < timedelta(seconds=PROBE_COOLDOWN_SEC):
+        left = PROBE_COOLDOWN_SEC - int((now - _last_probe).total_seconds())
+        await interaction.response.send_message(f"방금 점검했습니다. {left}초 뒤에 다시 시도해 주세요.", ephemeral=True)
+        return
+    _last_probe = now
+    await interaction.response.defer(ephemeral=True)
+
+    def board(html):
+        n = len(parse_general(html, ""))
+        return f"게시글 {n}건" if n else None
+
+    def menu(html):
+        return f"식당 {len(parse_menu(html))}곳"
+
+    targets = {cat: (url, board, None) for cat, url in CATEGORIES.items()}
+    targets["학식"] = (MENU_URL, menu, {'searchYmd': _today_kst().strftime('%Y.%m.%d'),
+                                       'searchLang': 'OCL04.10', 'searchView': 'cafeteria'})
+    # 사이버캠퍼스는 계정 잠금 위험이 있어 로그인하지 않고 로그인 페이지가 열리는지만 본다.
+    targets[CYBER_SRC] = (cyber_campus_URL, None, None)
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(*(_probe(session, url, parse, params)
+                                         for url, parse, params in targets.values()))
+
+    failed = sum(1 for ok, _ in results if not ok)
+    embed = discord.Embed(
+        title="🔌 실시간 점검",
+        description="지금 바로 요청해 본 결과입니다. (기록된 크롤 이력은 `/상태`)",
+        color=0xE74C3C if failed else 0x2ECC71,
+    )
+    for name, (ok, detail) in zip(targets, results):
+        if name == CYBER_SRC:
+            detail += " · 로그인 페이지만 확인"
+            if _cyber_auth_error:
+                ok, detail = False, detail + "\n⛔ 비밀번호 오류로 로그인 중단됨 (`.env` 수정 후 재시작 필요)"
+        embed.add_field(name=f"{'✅' if ok else '❌'} {name}", value=detail, inline=False)
+
+    loops = {"공지 크롤": crawl, "사이버캠퍼스": cyber_crawl, "마감 알림": deadline_reminder, "이상 감지": health_check}
+    lines = [f"디스코드 지연 {round(client.latency * 1000)}ms",
+             "루프 " + " · ".join(f"{'✅' if lp.is_running() else '❌'}{n}" for n, lp in loops.items())]
+    procs = _proc_counts()
+    if procs:
+        total, zombies = procs
+        lines.append(f"프로세스 {total}개 · 좀비 {zombies}개" + (" ⚠️" if zombies else ""))
+    embed.add_field(name="🤖 봇 내부", value="\n".join(lines), inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 # 날짜 선택지: 상대 날짜(+N일) 또는 요일(오늘 포함 가장 가까운 그 요일)
 MENU_DAY_CHOICES = [("오늘", "+0"), ("내일", "+1"), ("모레", "+2")] + \
                    [(f"{w}요일", f"w{i}") for i, w in enumerate("월화수목금토")]
